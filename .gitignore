@@ -11,3 +11,10 @@ build/
 *.tfstate.backup
 .terraform.lock.hcl
 .env
+
+# Runtime / debug output
+logs/
+*.log
+backend/out.txt
+backend/test-output.json
+frontend/latest_logs.txt
