@@ -17,7 +17,8 @@ BookFlow serves many businesses (tenants) from a single backend and database, wi
 - **Backend:** Node.js, Express, **Compression Middleware**, Morgan Logging.
 - **Database:** MongoDB with **Mongoose Compound Indexing** (multi-tenant isolation).
 - **Caching & Concurrency:** Redis (ioredis) for cache-aside slot caching and distributed booking locks.
-- **Security:** Dual-token JWT (Access/Refresh), Hierarchical RBAC, tenant-scoped queries.
+- **Security:** Dual-token JWT (Access/Refresh), Hierarchical RBAC, tenant-scoped queries, Helmet security headers, rate-limited auth endpoints.
+- **API Docs:** OpenAPI 3 spec with Swagger UI at `/api/docs`.
 - **Payments:** Stripe PaymentIntents API + Webhook Synchronization.
 - **DevOps:** Docker, Docker Compose, Kubernetes manifests, GitHub Actions (CI tests + ECR/EKS deploy workflow).
 - **Infrastructure:** Provisioned via Terraform.
@@ -72,6 +73,16 @@ Redis is an optimisation layer, not a source of truth: if `REDIS_URL` is unset o
 - **Atomic coupon usage:** a coupon use is consumed with a single conditional `findOneAndUpdate`, so a usage limit cannot be exceeded under concurrency, and is given back if the booking insert fails.
 - **Slot caching:** availability lookups are cached per tenant and staff (cache-aside) and invalidated whenever a booking, schedule, absence or service changes.
 
+### 🛡️ Security Hardening
+
+| Threat | Mitigation |
+|---|---|
+| Credential brute force | `express-rate-limit` on auth: 10 failed logins / 15 min and 5 registrations / hour per IP (`RateLimit-*` headers, `429` on excess) |
+| Duplicate or replayed Stripe webhooks | Signature verified on the raw body; every event id is stored under a unique index, so redeliveries are acknowledged but not re-applied. If processing fails the marker is removed so Stripe's retry can succeed |
+| Out-of-order payment events | Status transitions are guarded in the update query (`pending/failed → succeeded`, `pending → failed`), so a late event can never overwrite a refund |
+| Cross-tenant access | Every query is scoped by the caller's `tenantId`; booked services and staff must belong to the same tenant (covered by tests) |
+| Common web attacks | `helmet` sets CSP, HSTS, `X-Content-Type-Options`, frameguard and related headers |
+
 ### 🔐 Advanced RBAC & Hierarchy
 We implemented a professional **"Reports To"** hierarchy allowing for complex organizational management:
 - **Super Admin**: Platform-wide visibility and tenant management.
@@ -125,12 +136,15 @@ npm install
 npm run dev
 ```
 
-### 3. Run everything with Docker Compose
+### 3. API Documentation
+With the backend running, open **http://localhost:5000/api/docs** (Swagger UI) or fetch the raw spec from `/api/docs.json`.
+
+### 4. Run everything with Docker Compose
 ```bash
 docker compose up --build   # MongoDB, Redis, backend (:5000) and frontend (:5173)
 ```
 
-### 4. Database Seeding (Optional)
+### 5. Database Seeding (Optional)
 ```bash
 # Seed initial roles and a test coupon
 cd backend
