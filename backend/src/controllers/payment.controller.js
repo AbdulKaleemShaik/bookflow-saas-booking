@@ -1,5 +1,6 @@
 const Booking = require('../models/Booking.model');
 const Payment = require('../models/Payment.model');
+const ProcessedWebhookEvent = require('../models/ProcessedWebhookEvent.model');
 const Stripe = require('stripe');
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const { sendSuccess, sendError } = require('../utils/apiResponse');
@@ -56,20 +57,43 @@ const stripeWebhook = async (req, res) => {
         return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    if (event.type === 'payment_intent.succeeded') {
-        const pi = event.data.object;
-        await Payment.findOneAndUpdate(
-            { stripePaymentIntentId: pi.id },
-            { status: 'succeeded', stripeChargeId: pi.latest_charge }
-        );
-        await Booking.findByIdAndUpdate(pi.metadata.bookingId, {
-            paymentStatus: 'paid', status: 'confirmed',
-        });
+    // Idempotency: record the event id first. A duplicate delivery hits the unique
+    // index and is acknowledged without being applied a second time.
+    try {
+        await ProcessedWebhookEvent.create({ eventId: event.id, type: event.type });
+    } catch (err) {
+        if (err.code === 11000) return res.json({ received: true, duplicate: true });
+        throw err;
     }
 
-    if (event.type === 'payment_intent.payment_failed') {
-        const pi = event.data.object;
-        await Payment.findOneAndUpdate({ stripePaymentIntentId: pi.id }, { status: 'failed' });
+    try {
+        if (event.type === 'payment_intent.succeeded') {
+            const pi = event.data.object;
+            // Only pending/failed payments can become succeeded, so a late or replayed
+            // event can never overwrite a refund.
+            const payment = await Payment.findOneAndUpdate(
+                { stripePaymentIntentId: pi.id, status: { $in: ['pending', 'failed'] } },
+                { status: 'succeeded', stripeChargeId: pi.latest_charge }
+            );
+            if (payment) {
+                await Booking.findOneAndUpdate(
+                    { _id: pi.metadata.bookingId, paymentStatus: { $ne: 'refunded' } },
+                    { paymentStatus: 'paid', status: 'confirmed' }
+                );
+            }
+        }
+
+        if (event.type === 'payment_intent.payment_failed') {
+            const pi = event.data.object;
+            await Payment.findOneAndUpdate(
+                { stripePaymentIntentId: pi.id, status: 'pending' },
+                { status: 'failed' }
+            );
+        }
+    } catch (err) {
+        // Forget the event so Stripe's automatic retry can process it again.
+        await ProcessedWebhookEvent.deleteOne({ eventId: event.id }).catch(() => {});
+        throw err;
     }
 
     return res.json({ received: true });
