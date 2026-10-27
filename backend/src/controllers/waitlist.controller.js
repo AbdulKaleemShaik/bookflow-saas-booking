@@ -174,6 +174,9 @@ const confirmWaitlistEntry = catchAsync(async (req, res) => {
         bookingRef: `WL-${Date.now().toString(36).toUpperCase()}`
     });
 
+    const { invalidateSlots } = require('../utils/cache');
+    await invalidateSlots(tenantId, assignedStaffId);
+
     // 4. Update Waitlist
     entry.status = 'booked';
     await entry.save();

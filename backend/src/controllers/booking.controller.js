@@ -6,6 +6,8 @@ const Coupon = require('../models/Coupon.model');
 const { sendSuccess, sendError } = require('../utils/apiResponse');
 const { sendBookingConfirmation, sendBookingCancellation } = require('../services/email.service');
 const catchAsync = require('../utils/catchAsync');
+const { withLocks } = require('../utils/lock');
+const { isId, invalidateSlots } = require('../utils/cache');
 
 
 const generateRef = () => {
@@ -13,21 +15,64 @@ const generateRef = () => {
     return `BK-${Date.now().toString(36).toUpperCase()}-${rand}`;
 };
 
-// POST /api/bookings
+// Lock key for one staff member's calendar on one day. We lock the whole day
+// (not just the start time) because the conflict check is an *overlap* check:
+// 10:00-10:30 and 10:15-10:45 must also be serialised.
+const bookingLockKey = (tenantId, staffId, date) =>
+    `bf:lock:booking:${tenantId}:${staffId}:${date.toISOString().slice(0, 10)}`;
+
+const findConflict = (tenantId, staffId, bookingDate, startTime, endTime) =>
+    Booking.findOne({
+        tenantId, staffId,
+        bookingDate,
+        status: { $in: ['pending', 'confirmed'] },
+        $or: [{ startTime: { $lt: endTime }, endTime: { $gt: startTime } }],
+    });
+
+// Atomically consume one use of a coupon; returns the coupon or null if it is
+// no longer usable (expired / limit reached by a concurrent booking).
+const consumeCoupon = (couponId) =>
+    Coupon.findOneAndUpdate(
+        {
+            _id: couponId,
+            isActive: true,
+            expiryDate: { $gte: new Date() },
+            $or: [
+                { usageLimit: null },
+                { usageLimit: 0 },
+                { $expr: { $lt: ['$usedCount', '$usageLimit'] } },
+            ],
+        },
+        { $inc: { usedCount: 1 } },
+        { returnDocument: 'after' }
+    );
+
 // POST /api/bookings
 const createBooking = catchAsync(async (req, res, next) => {
     let { serviceId, staffId, bookingDate, startTime, tenantId, notes, selectedAddons: addonNames } = req.body;
     if (!serviceId || !staffId || !bookingDate || !startTime) {
         return res.status(400).json({ success: false, message: 'serviceId, staffId, bookingDate, and startTime are required' });
     }
+    if (!/^\d{2}:\d{2}$/.test(startTime) || Number.isNaN(new Date(bookingDate).getTime())) {
+        return res.status(400).json({ success: false, message: 'Invalid bookingDate or startTime (expected HH:mm)' });
+    }
+    if (!isId(serviceId) || !isId(staffId)) {
+        return res.status(400).json({ success: false, message: 'Invalid serviceId or staffId' });
+    }
 
     // Force tenant isolation (users can only book in their own tenant context)
     if (req.user.role?.name !== 'super_admin') {
         tenantId = req.user.tenantId;
     }
+    if (!isId(tenantId)) return res.status(400).json({ success: false, message: 'A tenant context is required to book' });
 
-    const service = await Service.findById(serviceId);
+    // Service and staff must belong to the booking tenant
+    const [service, staffMember] = await Promise.all([
+        Service.findOne({ _id: serviceId, tenantId }),
+        User.findOne({ _id: staffId, tenantId }).select('_id'),
+    ]);
     if (!service) return res.status(404).json({ success: false, message: 'Service not found' });
+    if (!staffMember) return res.status(404).json({ success: false, message: 'Staff member not found' });
 
     // Handle addons
     let extraDuration = 0;
@@ -52,50 +97,12 @@ const createBooking = catchAsync(async (req, res, next) => {
     const endMins = h * 60 + m + totalDuration;
     const endTime = `${String(Math.floor(endMins / 60)).padStart(2, '0')}:${String(endMins % 60).padStart(2, '0')}`;
 
-    // Check for conflict
-    const conflict = await Booking.findOne({
-        tenantId, staffId,
-        bookingDate: new Date(bookingDate),
-        status: { $in: ['pending', 'confirmed'] },
-        $or: [
-            { startTime: { $lt: endTime }, endTime: { $gt: startTime } }
-        ],
-    });
-    if (conflict) return res.status(409).json({ success: false, message: 'This time slot is already booked' });
-
-    const bookingRef = generateRef();
-    let totalAmount = service.price + extraPrice;
-    let discountAmount = 0;
-    let couponId = null;
-
-    // Apply coupon if provided
-    if (req.body.couponCode) {
-        const coupon = await Coupon.findOne({ 
-            code: req.body.couponCode.toUpperCase(), 
-            tenantId, 
-            isActive: true 
-        });
-
-        if (coupon && new Date() <= coupon.expiryDate && (!coupon.usageLimit || coupon.usedCount < coupon.usageLimit) && totalAmount >= coupon.minBookingAmount) {
-            discountAmount = coupon.type === 'percentage' ? (totalAmount * coupon.value) / 100 : coupon.value;
-            discountAmount = Math.min(discountAmount, totalAmount);
-            couponId = coupon._id;
-            
-            // Increment coupon usage
-            coupon.usedCount += 1;
-            await coupon.save();
-        }
-    }
-
+    // Work out every date this request books (1 for a normal booking, N for recurring)
     const { recurrence } = req.body;
-    let initialBooking;
     const isRecurring = recurrence?.isRecurring && recurrence?.count > 1 && recurrence?.frequency;
-
+    const baseDate = new Date(bookingDate);
+    const dates = [];
     if (isRecurring) {
-        const bookingsToCreate = [];
-        const baseDate = new Date(bookingDate);
-        const firstBookingRef = generateRef();
-
         for (let i = 0; i < recurrence.count; i++) {
             const currentDate = new Date(baseDate);
             if (recurrence.frequency === 'weekly') {
@@ -103,51 +110,87 @@ const createBooking = catchAsync(async (req, res, next) => {
             } else if (recurrence.frequency === 'monthly') {
                 currentDate.setMonth(baseDate.getMonth() + i);
             }
-
-            // Check for conflict per date
-            const conflict = await Booking.findOne({
-                tenantId, staffId,
-                bookingDate: currentDate,
-                status: { $in: ['pending', 'confirmed'] },
-                $or: [{ startTime: { $lt: endTime }, endTime: { $gt: startTime } }],
-            });
-
-            if (conflict) {
-                return res.status(409).json({ 
-                    success: false, 
-                    message: `Slot conflict on ${currentDate.toDateString()}. Please choose a different sequence or date.` 
-                });
-            }
-
-            bookingsToCreate.push({
-                tenantId, customerId: req.user._id, staffId, serviceId,
-                bookingDate: currentDate, startTime, endTime,
-                totalAmount, discountAmount, currency: service.currency,
-                notes, bookingRef: i === 0 ? firstBookingRef : generateRef(), 
-                status: 'pending', paymentStatus: 'unpaid',
-                couponId, selectedAddons, intakeResponses: req.body.intakeResponses,
-                recurrence: {
-                    isRecurring: true,
-                    frequency: recurrence.frequency,
-                    count: recurrence.count,
-                    parentBookingId: null // We'll link these after first one is created if needed, but for now BK ref links them
-                }
-            });
+            dates.push(currentDate);
         }
-
-        const created = await Booking.insertMany(bookingsToCreate);
-        initialBooking = created[0];
     } else {
-        initialBooking = await Booking.create({
-            tenantId, customerId: req.user._id, staffId, serviceId,
-            bookingDate: new Date(bookingDate), startTime, endTime,
-            totalAmount, discountAmount, currency: service.currency,
-            notes, bookingRef, status: 'pending', paymentStatus: 'unpaid',
-            couponId, selectedAddons, intakeResponses: req.body.intakeResponses
-        });
+        dates.push(baseDate);
     }
 
-    // Send confirmation email asynchronously (only for the first one for now to avoid spam)
+    const totalAmount = service.price + extraPrice;
+
+    // Look up the coupon outside the lock; one use is consumed atomically inside.
+    let coupon = null;
+    if (req.body.couponCode) {
+        const found = await Coupon.findOne({
+            code: String(req.body.couponCode).toUpperCase(),
+            tenantId,
+            isActive: true
+        });
+        if (found && new Date() <= found.expiryDate && (!found.usageLimit || found.usedCount < found.usageLimit) && totalAmount >= found.minBookingAmount) {
+            coupon = found;
+        }
+    }
+
+    // Critical section: conflict check + insert, serialised per staff/day with a
+    // Redis lock so two concurrent requests cannot both pass the check. If Redis
+    // is down, withLocks runs the function unlocked (Mongo check only).
+    const result = await withLocks(dates.map((d) => bookingLockKey(tenantId, staffId, d)), async () => {
+        for (const currentDate of dates) {
+            const conflict = await findConflict(tenantId, staffId, currentDate, startTime, endTime);
+            if (conflict) {
+                return {
+                    error: isRecurring
+                        ? `Slot conflict on ${currentDate.toDateString()}. Please choose a different sequence or date.`
+                        : 'This time slot is already booked',
+                };
+            }
+        }
+
+        let discountAmount = 0;
+        let couponId = null;
+        if (coupon && (await consumeCoupon(coupon._id))) {
+            discountAmount = coupon.type === 'percentage' ? (totalAmount * coupon.value) / 100 : coupon.value;
+            discountAmount = Math.min(discountAmount, totalAmount);
+            couponId = coupon._id;
+        }
+
+        const base = {
+            tenantId, customerId: req.user._id, staffId, serviceId,
+            startTime, endTime,
+            totalAmount, discountAmount, currency: service.currency,
+            notes, status: 'pending', paymentStatus: 'unpaid',
+            couponId, selectedAddons, intakeResponses: req.body.intakeResponses,
+        };
+
+        try {
+            if (isRecurring) {
+                const created = await Booking.insertMany(dates.map((d) => ({
+                    ...base,
+                    bookingDate: d,
+                    bookingRef: generateRef(),
+                    recurrence: {
+                        isRecurring: true,
+                        frequency: recurrence.frequency,
+                        count: recurrence.count,
+                        parentBookingId: null // BK ref links them for now
+                    }
+                })));
+                return { booking: created[0] };
+            }
+            return { booking: await Booking.create({ ...base, bookingDate: baseDate, bookingRef: generateRef() }) };
+        } catch (err) {
+            // Give the coupon use back if the booking could not be written
+            if (couponId) await Coupon.updateOne({ _id: couponId }, { $inc: { usedCount: -1 } });
+            throw err;
+        }
+    });
+
+    if (result.error) return res.status(409).json({ success: false, message: result.error });
+    const initialBooking = result.booking;
+
+    await invalidateSlots(tenantId, staffId);
+
+    // Send confirmation email (only for the first one for now to avoid spam)
     try {
         const [staff, tenant] = await Promise.all([
             User.findById(staffId).select('name'),
@@ -286,6 +329,7 @@ const updateBookingStatus = catchAsync(async (req, res, next) => {
     booking.status = status;
     if (cancellationReason) booking.cancellationReason = cancellationReason;
     await booking.save();
+    await invalidateSlots(booking.tenantId, booking.staffId);
 
     // Send cancellation email
     if (status === 'cancelled') {

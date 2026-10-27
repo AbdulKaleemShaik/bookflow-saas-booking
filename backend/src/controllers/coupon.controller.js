@@ -28,6 +28,9 @@ const getCoupons = catchAsync(async (req, res) => {
 // Validate a coupon (for customers during booking)
 const validateCoupon = catchAsync(async (req, res) => {
     const { code, tenantId, bookingAmount } = req.body;
+    if (!code || typeof code !== 'string' || !tenantId) {
+        return res.status(400).json({ success: false, message: 'code and tenantId are required' });
+    }
     
     const coupon = await Coupon.findOne({ 
         code: code.toUpperCase(), 

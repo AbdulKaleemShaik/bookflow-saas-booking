@@ -3,6 +3,7 @@ const Booking = require('../models/Booking.model');
 const { sendSuccess, sendError } = require('../utils/apiResponse');
 const { generateTimeSlots } = require('../utils/generateSlots');
 const catchAsync = require('../utils/catchAsync');
+const { TTL, keys, isId, hGetOrSet, invalidateSlots } = require('../utils/cache');
 
 
 // GET /api/schedules
@@ -44,17 +45,22 @@ const createSchedule = catchAsync(async (req, res, next) => {
     const schedule = await Schedule.create({
         tenantId: req.user.tenantId, staffId, dayOfWeek, startTime, endTime, slotDuration, breakStart, breakEnd,
     });
+    await invalidateSlots(req.user.tenantId, staffId);
     return sendSuccess(res, 201, 'Schedule created', schedule);
 });
 
 // PUT /api/schedules/:id
 const updateSchedule = catchAsync(async (req, res, next) => {
-    const schedule = await Schedule.findOneAndUpdate(
-        { _id: req.params.id, tenantId: req.user.tenantId },
-        req.body,
-        { returnDocument: 'after' }
-    );
+    // Never let the body move a schedule into another tenant
+    const { tenantId: _ignored, _id, ...updates } = req.body;
+    const filter = { _id: req.params.id, tenantId: req.user.tenantId };
+    const before = await Schedule.findOne(filter).select('staffId');
+    if (!before) return res.status(404).json({ success: false, message: 'Schedule not found' });
+
+    const schedule = await Schedule.findOneAndUpdate(filter, updates, { returnDocument: 'after' });
     if (!schedule) return res.status(404).json({ success: false, message: 'Schedule not found' });
+    // Invalidate both the old and (if reassigned) the new staff member's slots
+    await invalidateSlots(req.user.tenantId, before.staffId, schedule.staffId);
     return sendSuccess(res, 200, 'Schedule updated', schedule);
 });
 
@@ -62,19 +68,17 @@ const updateSchedule = catchAsync(async (req, res, next) => {
 const deleteSchedule = catchAsync(async (req, res, next) => {
     const schedule = await Schedule.findOneAndDelete({ _id: req.params.id, tenantId: req.user.tenantId });
     if (!schedule) return res.status(404).json({ success: false, message: 'Schedule not found' });
+    await invalidateSlots(req.user.tenantId, schedule.staffId);
     return sendSuccess(res, 200, 'Schedule deleted');
 });
 
 // GET /api/schedules/available-slots?staffId=&serviceId=&date=&tenantId=
-const getAvailableSlots = catchAsync(async (req, res, next) => {
-    const { staffId, date, tenantId } = req.query;
-    if (!staffId || !date) return res.status(400).json({ success: false, message: 'staffId and date are required' });
-
+const computeAvailableSlots = async ({ staffId, date, tenantId }) => {
     const bookingDate = new Date(date);
     const dayOfWeek = bookingDate.getDay();
 
-    const schedule = await Schedule.findOne({ tenantId, staffId, dayOfWeek, isActive: true });
-    if (!schedule) return sendSuccess(res, 200, 'No schedule for this day', { slots: [] });
+    const schedule = await Schedule.findOne({ tenantId, staffId, dayOfWeek, isActive: true }).lean();
+    if (!schedule) return { message: 'No schedule for this day', data: { slots: [] } };
 
     // Get existing bookings for that day
     const startOfDay = new Date(bookingDate.setHours(0, 0, 0, 0));
@@ -110,7 +114,23 @@ const getAvailableSlots = catchAsync(async (req, res, next) => {
         blockedRanges
     );
 
-    return sendSuccess(res, 200, 'Available slots fetched', { slots, schedule });
+    return { message: 'Available slots fetched', data: { slots, schedule } };
+};
+
+const getAvailableSlots = catchAsync(async (req, res, next) => {
+    const { staffId, date, tenantId } = req.query;
+    if (!staffId || !date) return res.status(400).json({ success: false, message: 'staffId and date are required' });
+
+    const load = () => computeAvailableSlots({ staffId, date, tenantId });
+
+    // Cache-aside: one Redis hash per (tenant, staff), one field per date.
+    // Only cache well-formed requests so arbitrary query strings can't create keys.
+    const cacheable = isId(tenantId) && isId(staffId) && /^\d{4}-\d{2}-\d{2}$/.test(date);
+    const { message, data } = cacheable
+        ? (await hGetOrSet(keys.slots(tenantId, staffId), date, TTL.SLOTS, load)).value
+        : await load();
+
+    return sendSuccess(res, 200, message, data);
 });
 
 module.exports = { getSchedules, createSchedule, updateSchedule, deleteSchedule, getAvailableSlots };

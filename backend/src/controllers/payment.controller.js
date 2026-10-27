@@ -4,6 +4,7 @@ const Stripe = require('stripe');
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const { sendSuccess, sendError } = require('../utils/apiResponse');
 const catchAsync = require('../utils/catchAsync');
+const { invalidateSlots } = require('../utils/cache');
 
 
 // POST /api/payments/checkout
@@ -90,7 +91,8 @@ const refundPayment = catchAsync(async (req, res, next) => {
     payment.refundReason = reason;
     await payment.save();
 
-    await Booking.findByIdAndUpdate(bookingId, { paymentStatus: 'refunded', status: 'cancelled', cancellationReason: reason });
+    const refunded = await Booking.findByIdAndUpdate(bookingId, { paymentStatus: 'refunded', status: 'cancelled', cancellationReason: reason });
+    if (refunded) await invalidateSlots(refunded.tenantId, refunded.staffId);
 
     return sendSuccess(res, 200, 'Refund processed', { refundId: refund.id });
 });

@@ -14,7 +14,7 @@ const authorize = (...roles) => {
 
 // Ensure the user belongs to the same tenant as the requested resource
 const sameTenant = (req, res, next) => {
-    if (req.user.role === 'super_admin') return next(); // super admin bypasses
+    if (req.user.role?.name === 'super_admin') return next(); // super admin bypasses
     const requestedTenantId = req.params.tenantId || req.body.tenantId || req.query.tenantId;
     if (requestedTenantId && req.user.tenantId?.toString() !== requestedTenantId) {
         return sendError(res, 403, 'Access to this tenant resource is forbidden');

@@ -22,6 +22,8 @@ spec:
           env:
             - name: PORT
               value: "5000"
+            - name: REDIS_URL
+              value: "redis://redis:6379"
             - name: MONGO_URI
               value: "mongodb://mongodb:27017/multi_tenant_booking"
             - name: JWT_SECRET
