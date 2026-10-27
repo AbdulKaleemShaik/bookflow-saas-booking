@@ -1,0 +1,355 @@
+openapi: 3.0.3
+info:
+  title: BookFlow API
+  version: 1.0.0
+  description: |
+    Multi-tenant booking platform API. Every authenticated request is scoped to the
+    caller's tenant (`tenantId` from the JWT); non-super-admins cannot act on another tenant.
+
+    **Auth:** `POST /api/auth/login` returns an access token (15 min) and a refresh token (7 days).
+    Send the access token as `Authorization: Bearer <token>`.
+
+    **Roles:** `super_admin`, `tenant_admin`, `manager`, `staff`, `customer`.
+servers:
+  - url: http://localhost:5000
+tags:
+  - name: Auth
+  - name: Tenants
+  - name: Services
+  - name: Schedules
+  - name: Bookings
+  - name: Payments
+  - name: Coupons
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        message: { type: string }
+    Tokens:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            accessToken: { type: string }
+            refreshToken: { type: string }
+            user: { type: object }
+    BookingRequest:
+      type: object
+      required: [serviceId, staffId, bookingDate, startTime]
+      properties:
+        serviceId: { type: string, description: Must belong to the caller's tenant }
+        staffId: { type: string, description: Must belong to the caller's tenant }
+        bookingDate: { type: string, format: date, example: '2026-11-03' }
+        startTime: { type: string, pattern: '^\d{2}:\d{2}$', example: '10:30' }
+        notes: { type: string }
+        couponCode: { type: string, example: WELCOME10 }
+        selectedAddons: { type: array, items: { type: string } }
+        recurrence:
+          type: object
+          properties:
+            isRecurring: { type: boolean }
+            frequency: { type: string, enum: [weekly, monthly] }
+            count: { type: integer, minimum: 2 }
+  responses:
+    Unauthorized:
+      description: Missing or invalid token
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Role not allowed, or resource belongs to another tenant
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    TooManyRequests:
+      description: Rate limit exceeded (see RateLimit headers)
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+paths:
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a customer under a tenant
+      description: Rate limited to 5 accounts per hour per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password, tenantSlug]
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+                phone: { type: string }
+                tenantSlug: { type: string, example: tailor }
+      responses:
+        '201': { description: Registered, content: { application/json: { schema: { $ref: '#/components/schemas/Tokens' } } } }
+        '400': { description: Validation error or unknown tenant }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      description: Rate limited to 10 failed attempts per 15 minutes per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+      responses:
+        '200': { description: Tokens issued, content: { application/json: { schema: { $ref: '#/components/schemas/Tokens' } } } }
+        '401': { description: Invalid credentials }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate the refresh token
+      description: The old refresh token is invalidated; reusing it is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200': { description: New token pair, content: { application/json: { schema: { $ref: '#/components/schemas/Tokens' } } } }
+        '401': { description: Invalid, expired or reused refresh token }
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user with populated role
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Current user }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/tenants/onboard:
+    post:
+      tags: [Tenants]
+      summary: Onboard a new business (creates the tenant and its admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [businessName, email, password, slug]
+              properties:
+                businessName: { type: string }
+                slug: { type: string, example: tailor }
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+                phone: { type: string }
+                description: { type: string }
+                address: { type: string }
+      responses:
+        '201': { description: Tenant and admin created }
+        '400': { description: Validation error or slug taken }
+  /api/tenants/public/{slug}:
+    get:
+      tags: [Tenants]
+      summary: Public booking-portal details for a tenant
+      parameters:
+        - { in: path, name: slug, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Tenant profile }
+        '404': { description: Unknown tenant }
+  /api/services:
+    get:
+      tags: [Services]
+      summary: List the tenant's services (cached in Redis per tenant)
+      responses:
+        '200': { description: Services }
+    post:
+      tags: [Services]
+      summary: Create a service (tenant_admin)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, duration, price]
+              properties:
+                name: { type: string }
+                description: { type: string }
+                duration: { type: integer, description: Minutes }
+                price: { type: number }
+                category: { type: string }
+                color: { type: string }
+                maxBookingsPerSlot: { type: integer }
+      responses:
+        '201': { description: Created; invalidates the services cache }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/schedules/available-slots:
+    get:
+      tags: [Schedules]
+      summary: Free slots for a staff member on a date
+      description: Schedule minus breaks, absences and existing bookings. Cached in Redis and invalidated on any change.
+      parameters:
+        - { in: query, name: staffId, required: true, schema: { type: string } }
+        - { in: query, name: date, required: true, schema: { type: string, format: date } }
+        - { in: query, name: tenantId, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Available start times }
+        '400': { description: Missing or malformed parameters }
+  /api/bookings:
+    post:
+      tags: [Bookings]
+      summary: Create a booking (single or recurring)
+      description: |
+        Concurrency-safe: a Redis lock per staff member per day (`SET NX PX` + Lua compare-and-delete release)
+        wraps the overlap check and insert, so simultaneous requests for overlapping slots cannot both succeed.
+        Coupon usage is consumed atomically. Falls back to a MongoDB-only check if Redis is unavailable.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookingRequest' }
+      responses:
+        '201': { description: Booking created (status pending, payment unpaid) }
+        '400': { description: Validation error }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Service or staff not found in this tenant }
+        '409': { description: Slot already booked, or the slot lock is held by another request }
+    get:
+      tags: [Bookings]
+      summary: List bookings visible to the caller
+      description: Customers see their own; staff see assigned ones; managers also see staff who report to them.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: status, schema: { type: string, enum: [pending, confirmed, completed, cancelled] } }
+        - { in: query, name: from, schema: { type: string, format: date } }
+        - { in: query, name: to, schema: { type: string, format: date } }
+        - { in: query, name: staffId, schema: { type: string } }
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: limit, schema: { type: integer, default: 20 } }
+      responses:
+        '200': { description: Paginated bookings }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/bookings/{id}/status:
+    put:
+      tags: [Bookings]
+      summary: Change booking status (tenant_admin, staff, super_admin)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [confirmed, completed, cancelled, no_show] }
+                cancellationReason: { type: string }
+      responses:
+        '200': { description: Updated; frees the slot and invalidates caches when cancelled }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/payments/checkout:
+    post:
+      tags: [Payments]
+      summary: Create a Stripe PaymentIntent for a booking
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bookingId]
+              properties:
+                bookingId: { type: string }
+      responses:
+        '200': { description: Client secret for Stripe Elements }
+  /api/payments/webhook:
+    post:
+      tags: [Payments]
+      summary: Stripe webhook (signature-verified, idempotent)
+      description: |
+        Verifies the `Stripe-Signature` header against the raw body. Each event id is recorded with a
+        unique index, so duplicate deliveries are acknowledged without being re-applied, and status
+        updates are guarded so a late event can never overwrite a refund.
+      responses:
+        '200': { description: Received (or duplicate ignored) }
+        '400': { description: Invalid signature }
+  /api/payments/refund:
+    post:
+      tags: [Payments]
+      summary: Refund a paid booking (tenant_admin, super_admin)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bookingId]
+              properties:
+                bookingId: { type: string }
+                reason: { type: string }
+      responses:
+        '200': { description: Refund processed; booking cancelled }
+        '404': { description: No successful payment for this booking in your tenant }
+  /api/coupons/validate:
+    post:
+      tags: [Coupons]
+      summary: Validate a coupon and preview the discount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, tenantId, bookingAmount]
+              properties:
+                code: { type: string }
+                tenantId: { type: string }
+                bookingAmount: { type: number }
+      responses:
+        '200': { description: Discount details }
+        '400': { description: Expired, exhausted, below minimum or unknown }
+  /api/coupons:
+    post:
+      tags: [Coupons]
+      summary: Create a coupon (tenant_admin)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, type, value, expiryDate]
+              properties:
+                code: { type: string }
+                type: { type: string, enum: [percentage, fixed] }
+                value: { type: number }
+                minBookingAmount: { type: number }
+                expiryDate: { type: string, format: date }
+                usageLimit: { type: integer }
+      responses:
+        '201': { description: Created }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/health:
+    get:
+      summary: Liveness check (reports Redis availability)
+      responses:
+        '200': { description: OK }

@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const compression = require('compression');
+const helmet = require('helmet');
 
 // Routes
 const authRoutes = require('./routes/auth.routes');
@@ -23,6 +24,12 @@ const { getRedis } = require('./config/redis');
 // Builds the Express app without side effects (no DB connection, no listen),
 // so it can be imported by server.js and by the test suite.
 const app = express();
+
+// Behind a load balancer / ingress, trust the first proxy so rate limits see the real client IP.
+app.set('trust proxy', 1);
+
+// Security headers (CSP, HSTS, no-sniff, frameguard, etc.)
+app.use(helmet());
 
 // HTTP Request Logging (silenced under Jest)
 if (process.env.NODE_ENV !== 'test') {
@@ -54,6 +61,11 @@ app.use('/api/reviews', reviewRoutes);
 app.use('/api/absences', absenceRoutes);
 app.use('/api/waitlist', waitlistRoutes);
 app.use('/api/roles', roleRoutes);
+
+// API docs (Swagger UI) and raw OpenAPI spec
+const docs = require('./docs');
+app.get('/api/docs.json', (req, res) => res.json(docs.spec));
+app.use('/api/docs', docs.serve, docs.setup);
 
 // Health check
 app.get('/api/health', (req, res) => res.json({
