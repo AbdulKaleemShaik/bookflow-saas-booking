@@ -1,9 +1,8 @@
 name: Build, Push, and Deploy to EKS
 
+# Manual trigger: run from the Actions tab once AWS credentials and the EKS cluster exist.
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 env:
   AWS_REGION: ap-south-1
